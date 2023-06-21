@@ -8,6 +8,10 @@
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <errno.h>
 
 #define BUFSIZE 512
 
@@ -25,7 +29,7 @@ bool recv_msg(int sd, int code, char *text) {
     int recv_s, recv_code;
 
     // receive the answer
-
+    recv_s = recv(sd, buffer, BUFSIZE, 0);
 
     // error checking
     if (recv_s < 0) warn("error receiving data");
@@ -48,15 +52,22 @@ bool recv_msg(int sd, int code, char *text) {
  **/
 void send_msg(int sd, char *operation, char *param) {
     char buffer[BUFSIZE] = "";
-
+    int len, bytes_sent;
+    
     // command formating
     if (param != NULL)
         sprintf(buffer, "%s %s\r\n", operation, param);
     else
         sprintf(buffer, "%s\r\n", operation);
 
-    // send command and check for errors
+    len = strlen(buffer);
 
+    printf("Enviando: %s",buffer);
+    // send command and check for errors
+    bytes_sent = send(sd, buffer, len, 0);
+    if(bytes_sent==-1) {
+        printf("Error: send! %s\n", strerror(errno));
+    }
 }
 
 /**
@@ -84,24 +95,33 @@ void authenticate(int sd) {
     input = read_input();
 
     // send the command to the server
-    
+    send_msg(sd,"USER",input);
+
     // relese memory
     free(input);
 
     // wait to receive password requirement and check for errors
-
+    if(!(recv_msg(sd,331,NULL))){
+        exit(1);
+    }
 
     // ask for password
     printf("passwd: ");
     input = read_input();
 
     // send the command to the server
-
+    send_msg(sd,"PASS",input);
 
     // release memory
     free(input);
 
     // wait for answer and process it and check for errors
+    if (recv_msg(sd,230,NULL)){
+        printf("Login correcto\n");
+    } else{
+        printf("Login incorrecto\n");
+        exit(1);
+    }
 
 }
 
@@ -116,8 +136,15 @@ void get(int sd, char *file_name) {
     FILE *file;
 
     // send the RETR command to the server
+    send_msg(sd, "RETR", file_name);
 
     // check for the response
+    if (recv_msg(sd,299,NULL)){
+        printf("Descargando archivo\n");
+    } else{
+        printf("Error al realizar el get\n");
+        exit(1);
+    }
 
     // parsing the file size from the answer received
     // "File %s size %ld bytes"
@@ -127,14 +154,25 @@ void get(int sd, char *file_name) {
     file = fopen(file_name, "w");
 
     //receive the file
-
-
+    while(1) {
+        recv_s = recv(sd, desc, r_size, 0);
+        if(recv_s > 0) {
+            fwrite(desc, 1, recv_s, file);
+        }
+        if(recv_s < r_size) {
+            break;
+        }
+    }
 
     // close the file
     fclose(file);
+    
+    printf("Archivo creado\n");
 
     // receive the OK from the server
-
+    if(!(recv_msg(sd,226,NULL))){
+        exit(1);
+    }
 }
 
 /**
@@ -143,9 +181,9 @@ void get(int sd, char *file_name) {
  **/
 void quit(int sd) {
     // send command QUIT to the client
-
+    send_msg(sd, "QUIT",NULL);
     // receive the answer from the server
-
+    recv_msg(sd,221,NULL);
 }
 
 /**
@@ -184,20 +222,58 @@ void operate(int sd) {
  *         ./myftp <SERVER_IP> <SERVER_PORT>
  **/
 int main (int argc, char *argv[]) {
+    setbuf(stdout, NULL);
+    printf("init....\n");
     int sd;
     struct sockaddr_in addr;
+    
+    int status;
+    struct addrinfo hints;
+    struct addrinfo *servinfo;  
 
     // arguments checking
+    if (argc < 3) {
+        errx(1, "IP address and Port expected as argument");
+    } else if (argc > 3) {
+        errx(1, "Too many arguments");
+    }
 
     // create socket and check for errors
-    
+    if((sd = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Error: could not create new socket %s\n", strerror(errno));
+        return 1;
+    }
+
     // set socket data    
+    memset(&hints, 0, sizeof hints); // asegúrate que la estructura está vacía
+    hints.ai_family = AF_UNSPEC; // no importa si es IPv4 o IPv6
+    hints.ai_socktype = SOCK_STREAM; // sockets de stream TCP
+    hints.ai_flags = AI_PASSIVE; // completa mi IP por mi
+    if ((status = getaddrinfo(argv[1], argv[2], &hints, &servinfo)) != 0) {
+        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
+        exit(1);
+    }
 
     // connect and check for errors
+    if(connect(sd, servinfo->ai_addr, servinfo->ai_addrlen) < 0) {
+        printf("\n Error: connect. %s\n", strerror(errno));
+        return 1;
+    }
 
+    char buffer[BUFSIZE];
     // if receive hello proceed with authenticate and operate if not warning
-
+    if(recv_msg(sd,220,NULL)){
+        printf("\n Conexion establecida.\n");
+    } else{
+        printf("\n Error al establecer conexion.\n");
+        return 1;
+    }
+    authenticate(sd);
+    operate(sd);
+    
     // close socket
+    close(sd);
+    freeaddrinfo(servinfo);
 
     return 0;
 }

@@ -8,9 +8,14 @@
 #include <err.h>
 
 #include <netinet/in.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+#define BACKLOG 20
 
 #define BUFSIZE 512
 #define CMDSIZE 4
+#define MSGSIZE 128
 #define PARSIZE 100
 
 #define MSG_220 "220 srvFtp version 1.0\r\n"
@@ -39,8 +44,7 @@ bool recv_cmd(int sd, char *operation, char *param) {
     int recv_s;
 
     // receive the command in the buffer and check for errors
-
-
+    recv_s = recv(sd, buffer, BUFSIZE,0);
 
     // expunge the terminator characters from the buffer
     buffer[strcspn(buffer, "\r\n")] = 0;
@@ -75,16 +79,34 @@ bool recv_cmd(int sd, char *operation, char *param) {
 bool send_ans(int sd, char *message, ...){
     char buffer[BUFSIZE];
 
+    int len, bytes_sent;
+
     va_list args;
     va_start(args, message);
 
     vsprintf(buffer, message, args);
     va_end(args);
+
+    len = strlen(buffer);
+
     // send answer preformated and check errors
+    bytes_sent = send(sd, buffer, len, 0);
+    if(bytes_sent==-1) {
+        printf("Error: send! %s\n", strerror(errno));
+        return false;
+    }
 
+    return true;
+}
 
+long int findSize(char *filename)
+{
+    struct stat file_status;
+    if (stat(filename, &file_status) < 0) {
+        return -1;
+    }
 
-
+    return file_status.st_size;
 }
 
 /**
@@ -96,21 +118,51 @@ bool send_ans(int sd, char *message, ...){
 void retr(int sd, char *file_path) {
     FILE *file;    
     int bread;
-    long fsize;
+    long int fsize;
     char buffer[BUFSIZE];
+    char msg[MSGSIZE];
+
+    printf("Enviando archivo\n");
+    
+    fsize = findSize(file_path);
 
     // check if file exists if not inform error to client
-
+    file = fopen(file_path, "r");
+    if (file == NULL){
+        sprintf(msg, MSG_550, file_path);
+        if (!(send_ans(sd, msg))){
+            exit(1);
+        }
+    }
+    
     // send a success message with the file length
+    sprintf(msg, MSG_299, file_path, fsize);
+    if (!(send_ans(sd, msg))){
+        exit(1);
+    }
 
-    // important delay for avoid problems with buffer size
-    sleep(1);
+
 
     // send the file
+    while(!feof(file)) {
+        bread = fread(buffer, 1, BUFSIZE, file);
+
+        if(bread > 0) {
+            send(sd, buffer, bread, 0);
+            // important delay to avoid problems with buffer size
+            sleep(1);
+        }
+    }
 
     // close the file
+    fclose(file);
+
+
+    printf("archivo envado\n");
 
     // send a completed transfer message
+    send_ans(sd, MSG_226);
+
 }
 /**
  * funcion: check valid credentials in ftpusers file
@@ -157,42 +209,63 @@ bool check_credentials(char *user, char *pass) {
  **/
 bool authenticate(int sd) {
     char user[PARSIZE], pass[PARSIZE];
+    char msg[MSGSIZE];
 
     // wait to receive USER action
-
+    if (!recv_cmd(sd,"USER",user)){
+        return false;
+    }
 
     // ask for password
+    sprintf(msg, MSG_331, user);
+    if (!(send_ans(sd, msg))){
+        return false;
+    }
 
     // wait to receive PASS action
+    if (!recv_cmd(sd,"PASS",pass)){
+        return false;
+    }
 
     // if credentials don't check denied login
+    if (!check_credentials(user,pass)){
+        send_ans(sd, MSG_530);
+        return false;
+    } else {
+        // confirm login
+        sprintf(msg,MSG_230, user);
+        if (!(send_ans(sd, msg))){
+            return false;
+        }
+        return true;
+    }
 
-    // confirm login
+
 }
 
 /**
  *  function: execute all commands (RETR|QUIT)
  *  sd: socket descriptor
  **/
-
 void operate(int sd) {
-    char op[CMDSIZE], param[PARSIZE];
+    char op[CMDSIZE+1], param[PARSIZE];
 
     while (true) {
         op[0] = param[0] = '\0';
         // check for commands send by the client if not inform and exit
-
-
+        recv_cmd(sd, op, param);
+        //strncpy(op, op, CMDSIZE);
+        //printf("b. op %s\n", op);
         if (strcmp(op, "RETR") == 0) {
             retr(sd, param);
         } else if (strcmp(op, "QUIT") == 0) {
             // send goodbye and close connection
-
-
-
-
+            send_ans(sd, MSG_221);
+            close(sd);
+            printf("Conexion cerrada... \n");
             break;
         } else {
+            printf("Comando invalido... \n");
             // invalid command
             // furute use
         }
@@ -204,7 +277,7 @@ void operate(int sd) {
  *         ./mysrv <SERVER_PORT>
  **/
 int main (int argc, char *argv[]) {
-
+    setbuf(stdout, NULL);
     // arguments checking
     if (argc < 2) {
         errx(1, "Port expected as argument");
@@ -217,21 +290,60 @@ int main (int argc, char *argv[]) {
     struct sockaddr_in master_addr, slave_addr;
 
     // create server socket and check errors
+    /*
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC; // usar IPv4 o IPv6, cualquiera
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE; // completa mi IP por mi
+
+    getaddrinfo(NULL, argv[1], &hints, &res);
+    */
+    if((master_sd = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
+        printf("\n Error: could not create new socket %s\n", strerror(errno));
+        return 1;
+    }
+
+    master_addr.sin_family = AF_INET;
+    master_addr.sin_port = htons(atoi(argv[1])); // short, orden de bytes de red
+    master_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    memset(master_addr.sin_zero, '\0', sizeof master_addr.sin_zero);
     
     // bind master socket and check errors
+    if(bind(master_sd, (struct sockaddr *)&master_addr, sizeof master_addr) < 0) {
+        printf("\n Error: bind %s\n", strerror(errno));
+        return 1;
+    }
 
     // make it listen
+    if(listen(master_sd, BACKLOG) < 0){
+        printf("\n Error: listen %s\n", strerror(errno));
+        return 1;
+    }
 
+    socklen_t addr_size;
+    
+    addr_size = sizeof (master_addr);
     // main loop
     while (true) {
         // accept connectiones sequentially and check errors
+        slave_sd = accept(master_sd, (struct sockaddr *)&master_addr, &addr_size);
 
         // send hello
+        if (!(send_ans(slave_sd, MSG_220))){
+            return 1;
+        }
 
         // operate only if authenticate is true
+        if (authenticate(slave_sd)){
+            operate(slave_sd);
+        } else {
+            printf("Intento de login incorrecto...\n");
+        }
+        
     }
 
     // close server socket
+    close(master_sd);
 
     return 0;
 }
